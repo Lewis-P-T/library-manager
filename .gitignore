@@ -1,0 +1,3 @@
+library.json
+*.tmp
+__pycache__/
