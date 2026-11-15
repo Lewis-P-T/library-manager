@@ -4,6 +4,7 @@ Run:        python library.py [--db library.json]
 Self-check: python library.py --selftest
 """
 import argparse
+import difflib
 import json
 import os
 import re
@@ -14,6 +15,8 @@ from datetime import date, timedelta
 DEFAULT_DB = "library.json"
 LOAN_DAYS = 14
 LOAN_LIMIT = 3
+FINE_PER_DAY = 0.25
+FINE_CAP = 10.00
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")  # ponytail: shape check only, not RFC 5322
 
 
@@ -144,6 +147,69 @@ class Library:
         self.save()
         return loans[0]
 
+    # ---- search ----
+    def search(self, query, limit=10, cutoff=0.6):
+        """Rank books by how well `query` matches title/author/ISBN.
+
+        Substring hits score highest (earlier = better); otherwise the best
+        difflib ratio against the whole field or any of its words is used,
+        so typos like "dnue" still find "Dune".
+        """
+        q = query.strip().lower()
+        if not q:
+            return []
+        q_isbn = q.replace("-", "").replace(" ", "")
+        results = []
+        for bid, b in self.data["books"].items():
+            best = 0.0
+            for field, weight in (("title", 1.0), ("author", 0.9)):
+                text = b[field].lower()
+                pos = text.find(q)
+                if pos >= 0:
+                    score = 2.0 - pos / (len(text) + 1)
+                else:
+                    score = max(difflib.SequenceMatcher(None, q, w).ratio()
+                                for w in [text] + text.split())
+                    if score < cutoff:
+                        score = 0.0
+                best = max(best, score * weight)
+            isbn = b["isbn"].replace("-", "").replace(" ", "").lower()
+            if q_isbn and isbn and q_isbn in isbn:
+                best = max(best, 3.0 if q_isbn == isbn else 1.5)
+            if best > 0:
+                results.append((best, bid))
+        results.sort(key=lambda r: (-r[0], self.data["books"][r[1]]["title"].lower()))
+        return [(bid, self.data["books"][bid], round(score, 3)) for score, bid in results[:limit]]
+
+    # ---- overdue & fines ----
+    @staticmethod
+    def days_late(loan, today):
+        end = date.fromisoformat(loan["returned"]) if loan["returned"] else today
+        return max(0, (end - date.fromisoformat(loan["due"])).days)
+
+    @classmethod
+    def fine(cls, loan, today):
+        return min(cls.days_late(loan, today) * FINE_PER_DAY, FINE_CAP)
+
+    def overdue(self, today=None):
+        """Active loans past due, most days late first."""
+        today = today or date.today()
+        rows = [(l, self.days_late(l, today)) for l in self.active_loans()]
+        rows = [(l, d) for l, d in rows if d > 0]
+        rows.sort(key=lambda r: (-r[1], r[0]["book"]))
+        return [{**l, "days_late": d, "fine": self.fine(l, today)} for l, d in rows]
+
+    def member_history(self, mid, today=None):
+        """All loans (past and present) for a member, newest first, plus total fines."""
+        mid = mid.strip().upper()
+        self._member(mid)
+        today = today or date.today()
+        loans = [l for l in self.data["loans"] if l["member"] == mid]
+        loans.sort(key=lambda l: l["out"], reverse=True)
+        rows = [{**l, "title": self.data["books"].get(l["book"], {}).get("title", "?"),
+                 "days_late": self.days_late(l, today), "fine": self.fine(l, today)} for l in loans]
+        return rows, round(sum(r["fine"] for r in rows), 2)
+
 
 def ask(prompt):
     try:
@@ -155,6 +221,7 @@ def ask(prompt):
 def menu(lib):
     actions = {"1": "Add book", "2": "List books", "3": "Add member", "4": "List members",
                "5": "Edit member", "6": "Check out", "7": "Return", "8": "Active loans",
+               "9": "Search books", "10": "Overdue report", "11": "Member history",
                "q": "Quit"}
     while True:
         print("\n== Library Manager ==")
@@ -203,6 +270,33 @@ def menu(lib):
                 print("No active loans.")
             for l in sorted(loans, key=lambda l: l["due"]):
                 print(f" {l['book']} -> {l['member']}  due {l['due']}")
+        elif choice == "9":
+            hits = lib.search(ask("Search title/author/ISBN: "))
+            if not hits:
+                print("No matches.")
+            for bid, b, _ in hits:
+                print(f" {bid}  {b['title']} - {b['author']}  {b['isbn']}  ({lib.available(bid)}/{b['copies']} in)")
+        elif choice == "10":
+            rows = lib.overdue()
+            if not rows:
+                print("Nothing overdue.")
+            for r in rows:
+                print(f" {r['book']} -> {r['member']}  due {r['due']}  {r['days_late']}d late  fine {r['fine']:.2f}")
+            if rows:
+                print(f" Total outstanding: {sum(r['fine'] for r in rows):.2f}")
+        elif choice == "11":
+            try:
+                rows, total = lib.member_history(ask("Member ID: "))
+            except ValueError as e:
+                print(f"Error: {e}")
+                continue
+            if not rows:
+                print("No loans yet.")
+            for r in rows:
+                status = f"returned {r['returned']}" if r["returned"] else "on loan"
+                late = f"  {r['days_late']}d late, fine {r['fine']:.2f}" if r["days_late"] else ""
+                print(f" {r['out']}  {r['book']} {r['title']}  due {r['due']}  {status}{late}")
+            print(f" Total fines: {total:.2f}")
         elif choice == "q":
             return
         else:
@@ -267,6 +361,30 @@ def selftest():
         assert lib.available(b1) == 1 and len(lib.active_loans(member=m1)) == 2
         lib.checkout(b4, m1, today=day)               # slot freed
         assert len(Library(path).active_loans()) == 4  # persisted
+
+        # search
+        lib.data["books"][b2]["isbn"] = "978-0-441-17271-9"
+        assert lib.search("dune")[0][0] == b2
+        assert lib.search("DNUE")[0][0] == b2                 # typo -> fuzzy
+        assert lib.search("austen")[0][0] == b3               # author
+        assert lib.search("9780441172719")[0][0] == b2        # ISBN, dashes ignored
+        assert lib.search("zzzzqq") == [] and lib.search("  ") == []
+        assert len(lib.search("e", limit=2)) == 2
+
+        # overdue & fines (b1 returned on day 0; m1 holds b2,b3,b4; m2 holds b1)
+        later = day + timedelta(days=LOAN_DAYS + 4)   # 4 days past due
+        rows = lib.overdue(today=later)
+        assert len(rows) == 4 and all(r["days_late"] == 4 for r in rows)
+        assert rows[0]["fine"] == 4 * FINE_PER_DAY
+        assert lib.overdue(today=day) == []
+        lib.return_book(b2, m1, today=later - timedelta(days=2))  # returned 2 days late
+        rows = lib.overdue(today=later)
+        assert len(rows) == 3 and b2 not in [r["book"] for r in rows]
+        assert lib.fine({"due": "2026-01-01", "returned": None}, date(2027, 1, 1)) == FINE_CAP
+        hist, total = lib.member_history("m0001", today=later)
+        assert len(hist) == 4                                 # b1, b2, b3, b4
+        assert total == 2 * FINE_PER_DAY + 2 * 4 * FINE_PER_DAY  # b2 late 2d; b3,b4 4d; b1 on time
+        fails(lib.member_history, "M9999")
     print("selftest OK")
 
 
