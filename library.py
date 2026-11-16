@@ -4,12 +4,14 @@ Run:        python library.py [--db library.json]
 Self-check: python library.py --selftest
 """
 import argparse
+import csv
 import difflib
 import json
 import os
 import re
 import sys
 import tempfile
+from collections import deque
 from datetime import date, timedelta
 
 DEFAULT_DB = "library.json"
@@ -17,11 +19,13 @@ LOAN_DAYS = 14
 LOAN_LIMIT = 3
 FINE_PER_DAY = 0.25
 FINE_CAP = 10.00
+LOAN_FIELDS = ["book", "title", "member", "name", "out", "due", "returned", "days_late", "fine"]
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")  # ponytail: shape check only, not RFC 5322
 
 
 def empty_data():
-    return {"books": {}, "members": {}, "loans": [], "next_id": {"book": 1, "member": 1}}
+    return {"books": {}, "members": {}, "loans": [], "holds": {},
+            "next_id": {"book": 1, "member": 1}}
 
 
 class Library:
@@ -135,6 +139,11 @@ class Library:
         loan = {"book": bid, "member": mid, "out": today.isoformat(),
                 "due": (today + timedelta(days=LOAN_DAYS)).isoformat(), "returned": None}
         self.data["loans"].append(loan)
+        queue = self.data["holds"].get(bid, [])
+        if mid in queue:  # their hold is fulfilled
+            queue.remove(mid)
+            if not queue:
+                del self.data["holds"][bid]
         self.save()
         return loan
 
@@ -145,7 +154,112 @@ class Library:
             raise ValueError("no active loan for that book and member")
         loans[0]["returned"] = (today or date.today()).isoformat()
         self.save()
-        return loans[0]
+        return loans[0], self._assign_hold(bid, today)
+
+    # ---- reservations ----
+    def reserve(self, bid, mid):
+        """Join the FIFO hold queue for a book with no copies on the shelf."""
+        bid, mid = bid.strip().upper(), mid.strip().upper()
+        self._member(mid)
+        if self.available(bid) > 0:
+            raise ValueError("a copy is available - check it out instead")
+        if mid in self.data["holds"].get(bid, []):
+            raise ValueError("member already has a hold on this book")
+        if self.active_loans(member=mid, book=bid):
+            raise ValueError("member already has this book")
+        queue = self.data["holds"].setdefault(bid, [])
+        queue.append(mid)
+        self.save()
+        return len(queue)
+
+    def cancel_hold(self, bid, mid):
+        bid, mid = bid.strip().upper(), mid.strip().upper()
+        queue = self.data["holds"].get(bid, [])
+        if mid not in queue:
+            raise ValueError("no such hold")
+        queue.remove(mid)
+        if not queue:
+            del self.data["holds"][bid]
+        self.save()
+
+    def holds(self, bid):
+        return list(self.data["holds"].get(bid.strip().upper(), []))
+
+    def _assign_hold(self, bid, today):
+        """Give a freed copy to the first eligible member in the queue.
+
+        Members who can't take it right now (e.g. at loan limit) keep their place.
+        Returns the member ID that got the book, or None.
+        """
+        queue = deque(self.data["holds"].get(bid, []))
+        skipped = []
+        winner = None
+        while queue and winner is None:
+            mid = queue.popleft()
+            try:
+                self.checkout(bid, mid, today=today)
+                winner = mid
+            except ValueError:
+                skipped.append(mid)
+        rest = skipped + list(queue)
+        if rest:
+            self.data["holds"][bid] = rest
+        else:
+            self.data["holds"].pop(bid, None)
+        self.save()
+        return winner
+
+    # ---- CSV import / export ----
+    def import_books_csv(self, path):
+        """Add books from a CSV with header title,author[,isbn][,copies].
+
+        Rows whose ISBN already exists are skipped. Returns (added_ids, errors).
+        """
+        known = {b["isbn"].replace("-", "") for b in self.data["books"].values() if b["isbn"]}
+        added, errors = [], []
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            missing = {"title", "author"} - set(reader.fieldnames or [])
+            if missing:
+                raise ValueError(f"CSV missing column(s): {', '.join(sorted(missing))}")
+            for n, row in enumerate(reader, start=2):  # line 1 is the header
+                try:
+                    isbn = (row.get("isbn") or "").strip()
+                    if isbn and isbn.replace("-", "") in known:
+                        raise ValueError(f"duplicate ISBN {isbn}")
+                    copies = int((row.get("copies") or "1").strip())
+                    added.append(self.add_book(row["title"] or "", row["author"] or "", isbn, copies))
+                    if isbn:
+                        known.add(isbn.replace("-", ""))
+                except ValueError as e:
+                    errors.append(f"line {n}: {e}")
+        return added, errors
+
+    def loan_rows(self, today=None):
+        """Every loan, flattened with titles/names, for export."""
+        today = today or date.today()
+        books, members = self.data["books"], self.data["members"]
+        return [{"book": l["book"], "title": books.get(l["book"], {}).get("title", "?"),
+                 "member": l["member"], "name": members.get(l["member"], {}).get("name", "?"),
+                 "out": l["out"], "due": l["due"], "returned": l["returned"] or "",
+                 "days_late": self.days_late(l, today), "fine": f"{self.fine(l, today):.2f}"}
+                for l in self.data["loans"]]
+
+    @staticmethod
+    def export_csv(path, rows, fields):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(rows)
+        return len(rows)
+
+    def export_loans_csv(self, path, today=None):
+        return self.export_csv(path, self.loan_rows(today), LOAN_FIELDS)
+
+    def export_overdue_csv(self, path, today=None):
+        rows = [r for r in self.loan_rows(today) if not r["returned"] and r["days_late"] > 0]
+        rows.sort(key=lambda r: (-r["days_late"], r["book"]))
+        return self.export_csv(path, rows, LOAN_FIELDS)
 
     # ---- search ----
     def search(self, query, limit=10, cutoff=0.6):
@@ -222,7 +336,8 @@ def menu(lib):
     actions = {"1": "Add book", "2": "List books", "3": "Add member", "4": "List members",
                "5": "Edit member", "6": "Check out", "7": "Return", "8": "Active loans",
                "9": "Search books", "10": "Overdue report", "11": "Member history",
-               "q": "Quit"}
+               "12": "Reserve book", "13": "Cancel reservation", "14": "Import books (CSV)",
+               "15": "Export loans (CSV)", "16": "Export overdue (CSV)", "q": "Quit"}
     while True:
         print("\n== Library Manager ==")
         for k, v in actions.items():
@@ -240,8 +355,10 @@ def menu(lib):
             if not books:
                 print("No books yet.")
             for bid, b in books:
-                print(f" {bid}  {b['title']} - {b['author']}  ({lib.available(bid)}/{b['copies']} in)")
-        elif choice in ("3", "5", "6", "7"):
+                waiting = len(lib.holds(bid))
+                hold = f"  [{waiting} waiting]" if waiting else ""
+                print(f" {bid}  {b['title']} - {b['author']}  ({lib.available(bid)}/{b['copies']} in){hold}")
+        elif choice in ("3", "5", "6", "7", "12", "13", "14", "15", "16"):
             try:
                 if choice == "3":
                     print(f"Added {lib.add_member(ask('Name: '), ask('Email (optional): '))}.")
@@ -253,10 +370,26 @@ def menu(lib):
                 elif choice == "6":
                     loan = lib.checkout(ask("Book ID: "), ask("Member ID: "))
                     print(f"Checked out, due {loan['due']}.")
+                elif choice == "7":
+                    _, nxt = lib.return_book(ask("Book ID: "), ask("Member ID: "))
+                    print("Returned." + (f" Reserved copy checked out to {nxt}." if nxt else ""))
+                elif choice == "12":
+                    print(f"Reserved - position {lib.reserve(ask('Book ID: '), ask('Member ID: '))} in queue.")
+                elif choice == "13":
+                    lib.cancel_hold(ask("Book ID: "), ask("Member ID: "))
+                    print("Reservation cancelled.")
+                elif choice == "14":
+                    added, errors = lib.import_books_csv(ask("CSV path (title,author,isbn,copies): ").strip())
+                    print(f"Imported {len(added)} book(s).")
+                    for err in errors:
+                        print(f"  skipped {err}")
+                elif choice == "15":
+                    path = ask("Save to [loans.csv]: ").strip() or "loans.csv"
+                    print(f"Wrote {lib.export_loans_csv(path)} loan(s) to {path}.")
                 else:
-                    lib.return_book(ask("Book ID: "), ask("Member ID: "))
-                    print("Returned.")
-            except ValueError as e:
+                    path = ask("Save to [overdue.csv]: ").strip() or "overdue.csv"
+                    print(f"Wrote {lib.export_overdue_csv(path)} overdue loan(s) to {path}.")
+            except (ValueError, OSError) as e:
                 print(f"Error: {e}")
         elif choice == "4":
             members = lib.list_members()
@@ -385,6 +518,53 @@ def selftest():
         assert len(hist) == 4                                 # b1, b2, b3, b4
         assert total == 2 * FINE_PER_DAY + 2 * 4 * FINE_PER_DAY  # b2 late 2d; b3,b4 4d; b1 on time
         fails(lib.member_history, "M9999")
+
+        # reservations: b3 (1 copy) is on loan to m1
+        m3 = lib.add_member("Cy")
+        fails(lib.reserve, b2, m2)                    # b2 is on the shelf
+        fails(lib.reserve, b3, m1)                    # m1 already has it
+        assert lib.reserve(b3, m2) == 1 and lib.reserve(b3, m3) == 2
+        fails(lib.reserve, b3, m2)                    # duplicate hold
+        assert lib.holds(b3) == [m2, m3]
+        _, nxt = lib.return_book(b3, m1, today=later)
+        assert nxt == m2 and lib.holds(b3) == [m3]    # FIFO auto-assign
+        assert lib.active_loans(member=m2, book=b3)
+        lib.cancel_hold(b3, m3)
+        assert lib.holds(b3) == [] and b3 not in lib.data["holds"]
+        fails(lib.cancel_hold, b3, m3)
+        # ineligible member at front keeps their place; next in line gets the copy
+        lib.reserve(b4, m2)                           # m2 holds b1,b3 -> will be at limit
+        lib.reserve(b4, m3)
+        lib.checkout(b2, m2, today=later)             # m2 now at LOAN_LIMIT
+        _, nxt = lib.return_book(b4, m1, today=later)
+        assert nxt == m3 and lib.holds(b4) == [m2]
+        assert Library(path).holds(b4) == [m2]        # persisted
+
+        # CSV import / export
+        src = os.path.join(d, "in.csv")
+        with open(src, "w", newline="", encoding="utf-8") as f:
+            f.write("title,author,isbn,copies\n"
+                    "Beloved,Morrison,111,2\n"
+                    "Dune again,Herbert,978-0441172719,1\n"   # dup ISBN of b2
+                    ",NoTitle,,1\n"
+                    "Bad copies,X,,zero\n"
+                    "Walden,Thoreau,,\n")
+        added, errors = lib.import_books_csv(src)
+        assert [lib.data["books"][b]["title"] for b in added] == ["Beloved", "Walden"]
+        assert len(errors) == 3 and errors[0].startswith("line 3")
+        assert lib.data["books"][added[0]]["copies"] == 2
+        bad = os.path.join(d, "bad.csv")
+        with open(bad, "w", encoding="utf-8") as f:
+            f.write("name,writer\nA,B\n")
+        fails(lib.import_books_csv, bad)
+        out = os.path.join(d, "loans.csv")
+        assert lib.export_loans_csv(out, today=later) == len(lib.data["loans"])
+        with open(out, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        assert rows[0]["title"] == "Zen" and rows[0]["name"] == "Ann"
+        od = os.path.join(d, "overdue.csv")
+        n = lib.export_overdue_csv(od, today=later)
+        assert n == len(lib.overdue(today=later)) > 0
     print("selftest OK")
 
 
