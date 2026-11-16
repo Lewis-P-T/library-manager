@@ -9,4 +9,4 @@ Python CLI (standard library only). Books, members and loans stored in a JSON fi
 - [x] 5. Overdue reports: overdue list sorted by days late, fines calculation, per-member history
 - [x] 6. Reservations: FIFO hold queue per book (collections.deque), auto-assign on return
 - [x] 7. Import/export: CSV import of books, CSV export of loans/overdue report
-- [ ] 8. Polish: stats dashboard (most borrowed, active members), tidy menus, README, full self-check coverage
+- [x] 8. Polish: stats dashboard (most borrowed, active members), tidy menus, README, full self-check coverage

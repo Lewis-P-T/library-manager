@@ -11,7 +11,7 @@ import os
 import re
 import sys
 import tempfile
-from collections import deque
+from collections import Counter, deque
 from datetime import date, timedelta
 
 DEFAULT_DB = "library.json"
@@ -325,6 +325,43 @@ class Library:
         return rows, round(sum(r["fine"] for r in rows), 2)
 
 
+    # ---- stats ----
+    def stats(self, today=None, top=5):
+        """Dashboard numbers: totals plus most-borrowed books and most active members."""
+        today = today or date.today()
+        books, members, loans = self.data["books"], self.data["members"], self.data["loans"]
+        overdue = self.overdue(today)
+        by_book = Counter(l["book"] for l in loans)
+        by_member = Counter(l["member"] for l in loans)
+        return {
+            "titles": len(books),
+            "copies": sum(b["copies"] for b in books.values()),
+            "members": len(members),
+            "loans_total": len(loans),
+            "on_loan": len(self.active_loans()),
+            "overdue": len(overdue),
+            "fines_outstanding": round(sum(r["fine"] for r in overdue), 2),
+            "holds": sum(len(q) for q in self.data["holds"].values()),
+            "most_borrowed": [(bid, books.get(bid, {}).get("title", "?"), n)
+                              for bid, n in sorted(by_book.items(), key=lambda kv: (-kv[1], kv[0]))[:top]],
+            "most_active": [(mid, members.get(mid, {}).get("name", "?"), n)
+                            for mid, n in sorted(by_member.items(), key=lambda kv: (-kv[1], kv[0]))[:top]],
+        }
+
+
+def print_stats(lib):
+    s = lib.stats()
+    print(f" Titles: {s['titles']}  Copies: {s['copies']}  Members: {s['members']}")
+    print(f" On loan: {s['on_loan']}  Overdue: {s['overdue']}  Holds waiting: {s['holds']}")
+    print(f" Loans ever: {s['loans_total']}  Fines outstanding: {s['fines_outstanding']:.2f}")
+    for heading, rows in (("Most borrowed", s["most_borrowed"]), ("Most active members", s["most_active"])):
+        print(f" {heading}:")
+        if not rows:
+            print("   (none yet)")
+        for i, (key, label, n) in enumerate(rows, 1):
+            print(f"   {i}. {key} {label} - {n} loan(s)")
+
+
 def ask(prompt):
     try:
         return input(prompt)
@@ -333,15 +370,20 @@ def ask(prompt):
 
 
 def menu(lib):
-    actions = {"1": "Add book", "2": "List books", "3": "Add member", "4": "List members",
-               "5": "Edit member", "6": "Check out", "7": "Return", "8": "Active loans",
-               "9": "Search books", "10": "Overdue report", "11": "Member history",
-               "12": "Reserve book", "13": "Cancel reservation", "14": "Import books (CSV)",
-               "15": "Export loans (CSV)", "16": "Export overdue (CSV)", "q": "Quit"}
+    sections = [
+        ("Books", [("1", "Add book"), ("2", "List books"), ("9", "Search books")]),
+        ("Members", [("3", "Add member"), ("4", "List members"), ("5", "Edit member"),
+                     ("11", "Member history")]),
+        ("Loans", [("6", "Check out"), ("7", "Return"), ("8", "Active loans"),
+                   ("12", "Reserve book"), ("13", "Cancel reservation")]),
+        ("Reports", [("10", "Overdue report"), ("17", "Stats dashboard"), ("14", "Import books (CSV)"),
+                     ("15", "Export loans (CSV)"), ("16", "Export overdue (CSV)")]),
+    ]
     while True:
         print("\n== Library Manager ==")
-        for k, v in actions.items():
-            print(f" {k}) {v}")
+        for title, items in sections:
+            print(f" {title}: " + "  ".join(f"{k}) {v}" for k, v in items))
+        print(" q) Quit")
         choice = ask("> ").strip().lower()
         if choice == "1":
             try:
@@ -430,6 +472,8 @@ def menu(lib):
                 late = f"  {r['days_late']}d late, fine {r['fine']:.2f}" if r["days_late"] else ""
                 print(f" {r['out']}  {r['book']} {r['title']}  due {r['due']}  {status}{late}")
             print(f" Total fines: {total:.2f}")
+        elif choice == "17":
+            print_stats(lib)
         elif choice == "q":
             return
         else:
@@ -565,16 +609,35 @@ def selftest():
         od = os.path.join(d, "overdue.csv")
         n = lib.export_overdue_csv(od, today=later)
         assert n == len(lib.overdue(today=later)) > 0
+
+        # stats dashboard
+        st = lib.stats(today=later)
+        assert st["titles"] == len(lib.data["books"]) == 6
+        assert st["members"] == 3 and st["loans_total"] == len(lib.data["loans"])
+        assert st["on_loan"] == len(lib.active_loans())
+        assert st["overdue"] == n and st["fines_outstanding"] == round(
+            sum(r["fine"] for r in lib.overdue(today=later)), 2)
+        assert st["holds"] == 1                         # m2 still waiting on b4
+        top_book = st["most_borrowed"][0]
+        assert top_book[2] == max(Counter(l["book"] for l in lib.data["loans"]).values())
+        assert st["most_active"][0][:2] == (m1, "Ann")  # Ann borrowed the most
+        assert len(lib.stats(top=1)["most_borrowed"]) == 1
+        empty = Library(os.path.join(d, "empty.json")).stats()
+        assert empty["titles"] == 0 and empty["most_borrowed"] == [] and empty["fines_outstanding"] == 0
     print("selftest OK")
 
 
 def main():
     p = argparse.ArgumentParser(description="Library Manager")
     p.add_argument("--db", default=DEFAULT_DB)
-    p.add_argument("--selftest", action="store_true")
+    p.add_argument("--selftest", action="store_true", help="run the built-in checks")
+    p.add_argument("--stats", action="store_true", help="print the stats dashboard and exit")
     args = p.parse_args()
     if args.selftest:
         selftest()
+        return
+    if args.stats:
+        print_stats(Library(args.db))
         return
     menu(Library(args.db))
 
